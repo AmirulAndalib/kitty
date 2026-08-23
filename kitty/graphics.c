@@ -344,14 +344,15 @@ set_command_failed_response(const char *code, const char *fmt, ...) {
     }
 
 static bool
-read_img_file(GraphicsManager *self, int fd, size_t sz, off_t offset, size_t max_to_read) {
+read_img_file(GraphicsManager *self, int fd, size_t sz, off_t offset, size_t max_to_read, bool is_shm) {
     LoadData *ld = &self->currently_loading;
     struct stat s;
     if (fstat(fd, &s) != 0) ABRT(EBADF, "Failed to fstat() the fd: %d file with error: [%d] %s", fd, errno, strerror(errno));
     // The graphics protocol specification mandates that only regular files be
     // read. Reading from FIFOs/devices/etc. can block forever or have
-    // side-effects.
-    if (!S_ISREG(s.st_mode)) ABRT(EBADF, "The image file with fd: %d is not a regular file", fd);
+    // side-effects. POSIX shared memory fds on macOS do not report as regular
+    // files via fstat(), so skip this check for them.
+    if (!is_shm && !S_ISREG(s.st_mode)) ABRT(EBADF, "The image file with fd: %d is not a regular file", fd);
     if (!sz) sz = offset < s.st_size ? (size_t)(s.st_size - offset) : 0;
     if (sz > max_to_read) sz = max_to_read;
     free(ld->buf);
@@ -678,7 +679,7 @@ load_image_data(
             // compressed) payload is needed, otherwise reading more than the
             // expected number of bytes is pointless.
             const size_t max_to_read = (g->compressed || data_fmt == PNG) ? MAX_DATA_SZ : load_data->data_sz;
-            load_data->loading_completed_successfully = read_img_file(self, fd, g->data_sz, g->data_offset, max_to_read);
+            load_data->loading_completed_successfully = read_img_file(self, fd, g->data_sz, g->data_offset, max_to_read, transmission_type == 's');
             safe_close(fd, __FILE__, __LINE__);
             if (transmission_type == 't' && strstr(fname, "tty-graphics-protocol") != NULL) {
                 if (global_state.boss) {
