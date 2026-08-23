@@ -41,10 +41,14 @@ cache_key(const ImageAndFrame x, char *key) {
 }
 #define CK(x) key, cache_key(x, key)
 
+// Transfers ownership of *data (a malloc() allocated pointer) to the cache,
+// setting it to NULL, on success. This avoids copying what are often many
+// megabytes of image data. Note that *data must not be used afterwards, the
+// cache write thread can modify it (encryption is done in-place) at any time.
 static bool
-add_to_cache(GraphicsManager *self, const ImageAndFrame x, const void *data, const size_t sz, bool memory_only) {
+add_to_cache(GraphicsManager *self, const ImageAndFrame x, void **data, const size_t sz, bool memory_only) {
     char key[CACHE_KEY_BUFFER_SIZE];
-    return add_to_disk_cache(self->disk_cache, CK(x), data, sz, memory_only);
+    return add_to_disk_cache_move(self->disk_cache, CK(x), data, sz, memory_only);
 }
 
 static bool
@@ -111,7 +115,22 @@ free_load_data(LoadData *ld) {
     ld->buf_used = 0;
     ld->buf_capacity = 0;
     ld->buf = NULL;
+    ld->data = NULL;
     ld->loading_for = (const ImageAndFrame){0};
+}
+
+// Moves the loaded image data into the cache. ld->data always aliases ld->buf,
+// so the load data is left empty on success.
+static bool
+add_load_data_to_cache(GraphicsManager *self, const ImageAndFrame x, bool memory_only) {
+    LoadData *ld = &self->currently_loading;
+    void *data = ld->data;
+    if (!add_to_cache(self, x, &data, ld->data_sz, memory_only)) return false;
+    ld->buf = NULL;
+    ld->data = NULL;
+    ld->buf_used = 0;
+    ld->buf_capacity = 0;
+    return true;
 }
 
 static void *
@@ -851,16 +870,12 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
             .transient = (g->usage_hints & GRAPHICS_USAGE_HINT_TRANSIENT) != 0,
         };
         if (!is_query) {
-            if (!add_to_cache(
-                    self,
-                    (const ImageAndFrame){.image_id = img->internal_id, .frame_id = img->root_frame.id},
-                    self->currently_loading.data,
-                    self->currently_loading.data_sz,
-                    img->root_frame.transient)) {
+            // Upload before caching, the cache takes ownership of the data
+            upload_to_gpu(self, img, img->root_frame.is_opaque, img->root_frame.is_4byte_aligned, self->currently_loading.data);
+            if (!add_load_data_to_cache(self, (const ImageAndFrame){.image_id = img->internal_id, .frame_id = img->root_frame.id}, img->root_frame.transient)) {
                 if (PyErr_Occurred()) PyErr_Print();
                 ABRT("ENOSPC", "Failed to store image data in cache");
             }
-            upload_to_gpu(self, img, img->root_frame.is_opaque, img->root_frame.is_4byte_aligned, self->currently_loading.data);
             self->used_storage += required_sz;
             img->used_storage = required_sz;
         }
@@ -1819,8 +1834,14 @@ handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, I
                     .needs_blending = transmitted_frame.alpha_blend && !transmitted_frame.is_opaque};
                 compose(d, cfd.buf, load_data->data);
                 free_load_data(load_data);
-                load_data->data = cfd.buf;
+                // Transfer ownership of the coalesced frame to the load data,
+                // keeping data aliased to buf so it is freed/moved as usual
                 load_data->data_sz = (size_t)img->width * img->height * d.under_px_sz;
+                load_data->buf = cfd.buf;
+                cfd.buf = NULL;
+                load_data->buf_capacity = load_data->data_sz;
+                load_data->buf_used = load_data->data_sz;
+                load_data->data = load_data->buf;
                 transmitted_frame.width = img->width;
                 transmitted_frame.height = img->height;
                 transmitted_frame.x = 0;
@@ -1834,7 +1855,7 @@ handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, I
             }
         }
         *frame = transmitted_frame;
-        if (!add_to_cache(self, key, load_data->data, load_data->data_sz, frame->transient)) {
+        if (!add_load_data_to_cache(self, key, frame->transient)) {
             img->extra_framecnt--;
             if (PyErr_Occurred()) PyErr_Print();
             ABRT("ENOSPC", "Failed to cache data for image frame");
@@ -1873,12 +1894,15 @@ handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, I
             .needs_blending = transmitted_frame.alpha_blend && !transmitted_frame.is_opaque};
         compose(d, cfd.buf, load_data->data);
         const ImageAndFrame key = {.image_id = img->internal_id, .frame_id = frame->id};
-        bool added = add_to_cache(self, key, cfd.buf, (size_t)bytes_per_pixel * frame->width * frame->height, frame->transient);
-        if (added && frame == current_frame(img)) {
+        // Upload before caching, the cache takes ownership of the data
+        if (frame == current_frame(img)) {
             update_current_frame(self, img, &cfd);
             *is_dirty = true;
         }
-        free(cfd.buf);
+        void *frame_data = cfd.buf;
+        cfd.buf = NULL;
+        bool added = add_to_cache(self, key, &frame_data, (size_t)bytes_per_pixel * frame->width * frame->height, frame->transient);
+        free(frame_data); // NULL if ownership was transferred to the cache
         if (!added) {
             if (PyErr_Occurred()) PyErr_Print();
             ABRT("ENOSPC", "Failed to cache data for image frame");
@@ -2087,12 +2111,6 @@ handle_compose_command(GraphicsManager *self, bool *is_dirty, const GraphicsComm
     compose_rectangles(d, dest_data.buf, src_data.buf);
     bool transient = src_data.transient || dest_data.transient;
     const ImageAndFrame key = {.image_id = img->internal_id, .frame_id = dest_frame->id};
-    if (!add_to_cache(self, key, dest_data.buf, ((size_t)(dest_data.is_opaque ? 3 : 4)) * img->width * img->height, transient)) {
-        if (PyErr_Occurred()) PyErr_Print();
-        set_command_failed_response("ENOSPC", "Failed to store image data in cache");
-    } else {
-        dest_frame->transient = transient;
-    }
     // frame is now a fully coalesced frame
     dest_frame->x = 0;
     dest_frame->y = 0;
@@ -2100,8 +2118,19 @@ handle_compose_command(GraphicsManager *self, bool *is_dirty, const GraphicsComm
     dest_frame->height = img->height;
     dest_frame->base_frame_id = 0;
     dest_frame->bgcolor = 0;
+    // Upload before caching, the cache takes ownership of the data
     *is_dirty = (g->other_frame_number - 1) == img->current_frame_index;
     if (*is_dirty) update_current_frame(self, img, &dest_data);
+    const size_t dest_sz = ((size_t)(dest_data.is_opaque ? 3 : 4)) * img->width * img->height;
+    void *dest_buf = dest_data.buf;
+    dest_data.buf = NULL;
+    if (!add_to_cache(self, key, &dest_buf, dest_sz, transient)) {
+        free(dest_buf);
+        if (PyErr_Occurred()) PyErr_Print();
+        set_command_failed_response("ENOSPC", "Failed to store image data in cache");
+    } else {
+        dest_frame->transient = transient;
+    }
 }
 // }}}
 
